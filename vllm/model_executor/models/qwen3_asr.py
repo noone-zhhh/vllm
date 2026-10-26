@@ -22,7 +22,7 @@
 # limitations under the License.
 """Inference-only Qwen3-ASR model."""
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Hashable, Iterable, Mapping, Sequence
 from typing import Any
 
 import regex as re
@@ -41,6 +41,7 @@ from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     StreamingTranscriptionPostProcessor,
     SupportsEagle3,
+    SupportsEncoderCudaGraph,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsMultiModal,
@@ -94,7 +95,13 @@ from vllm.transformers_utils.configs.qwen3_asr import (
 )
 from vllm.transformers_utils.processor import cached_processor_from_config
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
-from vllm.utils.torch_utils import async_tensor_h2d
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.worker.encoder_cudagraph_defs import (
+    EncoderCudaGraphCaptureInputs,
+    EncoderCudaGraphConfig,
+    EncoderCudaGraphReplayBuffers,
+    EncoderItemSpec,
+)
 
 logger = init_logger(__name__)
 _ASR_TEXT_TAG = "<asr_text>"
@@ -398,6 +405,7 @@ class Qwen3ASRForConditionalGeneration(
     SupportsTranscription,
     SupportsLoRA,
     SupportsEagle3,
+    SupportsEncoderCudaGraph,
 ):
     # LoRA support
     packed_modules_mapping = {
@@ -516,11 +524,7 @@ class Qwen3ASRForConditionalGeneration(
         audio_input: Qwen2_5OmniAudioFeatureInputs,
     ) -> torch.Tensor:
         input_features = audio_input["input_features"]
-        # audio_feature_lengths is keep_on_cpu; the audio tower derives
-        # device placement from feature_lens, so move it explicitly.
-        audio_feature_lengths = async_tensor_h2d(
-            audio_input["audio_feature_lengths"], input_features.device
-        )
+        audio_feature_lengths = audio_input["audio_feature_lengths"]
 
         audio_output_lengths = _get_feat_extract_output_lengths(audio_feature_lengths)
 
@@ -532,6 +536,135 @@ class Qwen3ASRForConditionalGeneration(
         with gpu_sync_allowed():
             split_sizes = audio_output_lengths.tolist()
         return audio_features.split(split_sizes)
+
+    def get_input_modality(self, mm_kwargs: dict[str, Any]) -> str:
+        return "audio"
+
+    def get_encoder_cudagraph_config(self) -> EncoderCudaGraphConfig:
+        if self.audio_tower.attn_backend != AttentionBackendEnum.FLASH_ATTN:
+            raise ValueError("Qwen3-ASR encoder CUDA graphs require FLASH_ATTN")
+        if self.vllm_config.lora_config is not None:
+            raise ValueError("Qwen3-ASR encoder CUDA graphs do not support LoRA")
+        if self.vllm_config.parallel_config.tensor_parallel_size != 1:
+            raise ValueError("Qwen3-ASR encoder CUDA graphs currently require TP=1")
+        return EncoderCudaGraphConfig(
+            modalities=["audio"],
+            buffer_keys=["hidden_states", "cu_seqlens"],
+            out_hidden_size=self.config.audio_config.output_dim,
+            padding_logics={"cu_seqlens": self._pad_audio_cu_seqlens},
+        )
+
+    @staticmethod
+    def _pad_audio_cu_seqlens(dst: torch.Tensor, src: torch.Tensor) -> None:
+        # Repeated final offsets describe empty sequences. Padding tokens
+        # never become keys/values of a real audio attention window.
+        dst.copy_(src[-1].expand_as(dst))
+        dst[: src.numel()].copy_(src)
+
+    @property
+    def _audio_window_tokens(self) -> int:
+        tower = self.audio_tower
+        return ((tower.n_window * 2 + 7) // 8) * (
+            tower.n_window_infer // (tower.n_window * 2)
+        )
+
+    def get_encoder_cudagraph_budget_range(
+        self, vllm_config: VllmConfig
+    ) -> tuple[int, int]:
+        # Bound default graph memory for a single consumer GPU.
+        maximum = min(512, vllm_config.model_config.max_model_len)
+        return min(64, maximum), maximum
+
+    def get_encoder_cudagraph_item_specs(
+        self, mm_kwargs: dict[str, Any]
+    ) -> list[EncoderItemSpec]:
+        lengths = mm_kwargs["audio_feature_lengths"]
+        outputs = _get_feat_extract_output_lengths(lengths)
+        return [
+            EncoderItemSpec(input_size=int(length), output_tokens=int(output))
+            for length, output in zip(lengths, outputs)
+        ]
+
+    def select_encoder_cudagraph_items(
+        self, mm_kwargs: dict[str, Any], indices: list[int]
+    ) -> dict[str, Any]:
+        audio = self._parse_and_validate_audio_input(**mm_kwargs)
+        assert audio is not None
+        lengths = audio["audio_feature_lengths"]
+        features = audio["input_features"]
+        offsets = [0, *lengths.cumsum(0).tolist()]
+        return {
+            "input_audio_features": torch.cat(
+                [features[:, offsets[i] : offsets[i + 1]] for i in indices], dim=1
+            )
+            if indices
+            else features[:, :0],
+            "audio_feature_lengths": lengths[indices],
+        }
+
+    def prepare_encoder_cudagraph_capture_inputs(
+        self,
+        token_budget: int,
+        max_batch_size: int,
+        max_frames_per_batch: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        path: str = "default",
+        axis_keys: tuple[Hashable, ...] | None = None,
+    ) -> EncoderCudaGraphCaptureInputs:
+        window = self._audio_window_tokens
+        # Each clip can contribute one partial attention window.
+        num_offsets = token_budget // window + max_batch_size + 1
+        offsets = torch.arange(num_offsets, device=device, dtype=torch.int32)
+        offsets = (offsets * window).clamp_max(token_budget)
+        return EncoderCudaGraphCaptureInputs(
+            values={
+                "hidden_states": torch.zeros(
+                    token_budget,
+                    self.config.audio_config.d_model,
+                    device=device,
+                    dtype=self.audio_tower.dtype,
+                ),
+                "cu_seqlens": offsets,
+                "max_seqlen": torch.tensor(window, dtype=torch.int32),
+            }
+        )
+
+    def prepare_encoder_cudagraph_replay_buffers(
+        self,
+        mm_kwargs: dict[str, Any],
+        max_batch_size: int,
+        max_frames_per_batch: int,
+        path: str = "default",
+    ) -> EncoderCudaGraphReplayBuffers:
+        audio = self._parse_and_validate_audio_input(**mm_kwargs)
+        assert audio is not None
+        lengths = audio["audio_feature_lengths"]
+        hidden, offsets, _ = self.audio_tower.prepare_encoder_inputs(
+            audio["input_features"].to(self.audio_tower.dtype),
+            lengths,
+            _get_feat_extract_output_lengths(lengths),
+        )
+        return EncoderCudaGraphReplayBuffers(
+            values={
+                "hidden_states": hidden,
+                "cu_seqlens": offsets,
+            }
+        )
+
+    def encoder_cudagraph_forward(
+        self, values: dict[str, torch.Tensor], path: str = "default"
+    ) -> torch.Tensor:
+        return self.audio_tower.forward_encoder(
+            values["hidden_states"], values["cu_seqlens"], values["max_seqlen"]
+        )
+
+    def encoder_eager_forward(
+        self, mm_kwargs: dict[str, Any], path: str = "default"
+    ) -> torch.Tensor:
+        audio = self._parse_and_validate_audio_input(**mm_kwargs)
+        assert audio is not None
+        return torch.cat(self._process_audio_input(audio))
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | None:
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)

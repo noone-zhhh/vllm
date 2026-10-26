@@ -1522,3 +1522,16 @@ class TestInitInvariantValidation:
 
         with pytest.raises(ValueError, match="must be positive"):
             CompilationConfig(encoder_cudagraph_token_budgets=[-1, 64])
+
+
+@pytest.mark.parametrize("offsets", [[0, 1], [0, 13, 26], [0, 52, 64]])
+def test_asr_padding_preserves_attention_boundaries(offsets):
+    from vllm.model_executor.models.qwen3_asr import (
+        Qwen3ASRForConditionalGeneration,
+    )
+
+    # Reusing a buffer must remove stale boundaries from the preceding replay.
+    dst = torch.arange(8, dtype=torch.int32) * 100
+    src = torch.tensor(offsets, dtype=torch.int32)
+    Qwen3ASRForConditionalGeneration._pad_audio_cu_seqlens(dst, src)
+    assert dst.tolist() == offsets + [offsets[-1]] * (8 - len(offsets))

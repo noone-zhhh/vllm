@@ -454,30 +454,26 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
     def device(self) -> torch.device:
         return self.conv2d1.weight.device
 
-    def forward(
+    def prepare_encoder_inputs(
         self,
         input_features: torch.Tensor,
         feature_lens: torch.Tensor,
         aftercnn_lens: torch.Tensor,
     ):
-        # Compute chunk information.
-        chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
-
+        # Metadata stays on CPU; only attention offsets and gather indices
+        # need device copies. ASR already supplies CPU feature lengths.
         with gpu_sync_allowed():
-            total_chunks = int(chunk_num.sum())
-
-        chunk_lengths = async_tensor_h2d(
-            [self.n_window * 2] * total_chunks,
-            dtype=torch.long,
-            device=feature_lens.device,
-        )
-        tail_chunk_index = F.pad(chunk_num, (1, 0), value=-1).cumsum(0)[1:]
-        chunk_lengths[tail_chunk_index] = feature_lens % (self.n_window * 2)
-        chunk_lengths[chunk_lengths == 0] = self.n_window * 2
+            lengths = feature_lens.cpu().tolist()
+            aftercnn_lens_list = aftercnn_lens.cpu().tolist()
+        chunk_size = self.n_window * 2
+        chunk_lengths_list = [
+            min(chunk_size, length - offset)
+            for length in lengths
+            for offset in range(0, length, chunk_size)
+        ]
+        chunk_lengths = torch.tensor(chunk_lengths_list, dtype=torch.long)
 
         # Split input features into chunks and pad
-        with gpu_sync_allowed():
-            chunk_lengths_list = chunk_lengths.tolist()
         chunk_list = input_features.T.split(chunk_lengths_list, dim=0)
         padded_feature = nn.utils.rnn.pad_sequence(
             chunk_list, batch_first=True
@@ -485,13 +481,14 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
 
         # Compute feature lengths after CNN
         feature_lens_after_cnn = self._get_cnn_output_lengths(chunk_lengths)
-        # Vectorized mask creation: avoid creating many small tensors.
-        with gpu_sync_allowed():
-            max_len_after_cnn = feature_lens_after_cnn.max().item()
-        indices = torch.arange(max_len_after_cnn, device=padded_feature.device)
-        padded_mask_after_cnn = indices.unsqueeze(0) < feature_lens_after_cnn.unsqueeze(
-            1
+        max_len_after_cnn = int(feature_lens_after_cnn.max())
+        gather_indices = torch.cat(
+            [
+                torch.arange(int(length)) + i * max_len_after_cnn
+                for i, length in enumerate(feature_lens_after_cnn)
+            ]
         )
+        gather_indices = async_tensor_h2d(gather_indices, padded_feature.device)
 
         # Add channel dimension for conv2d
         padded_feature = padded_feature.unsqueeze(1)
@@ -526,14 +523,11 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
         )
         padded_embed = padded_embed + positional_embedding
 
-        with gpu_sync_allowed():
-            hidden_states = padded_embed[padded_mask_after_cnn]
-            # Use tolist() for efficient batch conversion from tensor to Python.
-            aftercnn_lens_list = aftercnn_lens.tolist()
+        hidden_states = padded_embed.flatten(0, 1).index_select(0, gather_indices)
 
         # Compute cumulative sequence lengths for chunked attention
         cu_chunk_lens = [0]
-        window_aftercnn = padded_mask_after_cnn.shape[-1] * (
+        window_aftercnn = max_len_after_cnn * (
             self.n_window_infer // (self.n_window * 2)
         )
         for cnn_len in aftercnn_lens_list:
@@ -543,11 +537,37 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
             if remainder:
                 cu_chunk_lens.append(remainder)
         cu_seqlens = async_tensor_h2d(
-            cu_chunk_lens, dtype=torch.int32, device=aftercnn_lens.device
-        ).cumsum(-1, dtype=torch.int32)
+            torch.tensor(cu_chunk_lens, dtype=torch.int32).cumsum(
+                -1, dtype=torch.int32
+            ),
+            device=input_features.device,
+        )
 
-        max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
+        max_seqlen = None
+        if self.attn_backend in {
+            AttentionBackendEnum.FLASH_ATTN,
+            AttentionBackendEnum.ROCM_AITER_FA,
+            AttentionBackendEnum.TRITON_ATTN,
+        }:
+            max_seqlen = torch.tensor(max(cu_chunk_lens), dtype=torch.int32)
+        return hidden_states, cu_seqlens, max_seqlen
 
+    def forward(
+        self,
+        input_features: torch.Tensor,
+        feature_lens: torch.Tensor,
+        aftercnn_lens: torch.Tensor,
+    ):
+        return self.forward_encoder(
+            *self.prepare_encoder_inputs(input_features, feature_lens, aftercnn_lens)
+        )
+
+    def forward_encoder(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: torch.Tensor | None,
+    ) -> torch.Tensor:
         # Apply transformer layers
         for encoder_layer in self.layers:
             hidden_states = encoder_layer(

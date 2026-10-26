@@ -526,9 +526,9 @@ class CompilationConfig:
 
     # Vision encoder CUDA graph
     cudagraph_mm_encoder: bool = False
-    """Enable CUDA graph capture for multimodal encoder (ViT).
-    When enabled, captures full encoder forward as CUDA graph
-    for each token budget level."""
+    """Enable CUDA graph capture for supported multimodal encoders.
+    Captures the full vision encoder or the Qwen3-ASR Transformer and
+    output projection for each token budget level."""
 
     encoder_cudagraph_token_budgets: list[int] = field(default_factory=list)
     """Token budget levels for encoder CUDA graph capture.
@@ -540,7 +540,8 @@ class CompilationConfig:
     Example: [2048, 4096, 8192, 13824]"""
 
     encoder_cudagraph_max_vision_items_per_batch: int = 0
-    """Maximum number of images/videos per batch for encoder CUDA graph capture.
+    """Maximum number of multimodal items per encoder CUDA graph batch.
+    For Qwen3-ASR this counts audio clips.
     Determines the fixed batch size used during graph capture.
     If 0 (default), auto-inferred as max_budget // min_budget from the
     model's budget range. User-provided positive value overrides

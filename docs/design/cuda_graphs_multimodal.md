@@ -320,3 +320,84 @@ vllm bench mm-processor \
 
 !!! note
     Find more details about benchmarks on GPUs (A100) for video inference at [#38061](https://github.com/vllm-project/vllm/pull/38061).
+
+## Qwen3-ASR audio encoder
+
+Qwen3-ASR can reuse the encoder CUDA Graph manager by enabling
+`cudagraph_mm_encoder` (disabled by default). This path captures the audio
+Transformer layers, final normalization, and output projection. Mel chunking,
+CNNs, positional embeddings, and packing run outside the graph. Both model
+runners use the existing audio modality routing; no scheduler or KV-cache
+changes are required.
+
+The initial implementation requires TP=1, `FLASH_ATTN` for encoder attention,
+and no LoRA. Other configurations are rejected when encoder graphs are enabled.
+The feature also applies to the shared audio tower inherited by the forced
+aligner, but forced-aligner quality has not been evaluated.
+
+```bash
+vllm serve Qwen/Qwen3-ASR-0.6B \
+  --dtype bfloat16 \
+  --max-model-len 4096 \
+  --max-num-seqs 4 \
+  --mm-encoder-attn-backend FLASH_ATTN \
+  --compilation-config '{"cudagraph_mm_encoder": true, "encoder_cudagraph_token_budgets": [64, 128, 256, 512], "encoder_cudagraph_max_vision_items_per_batch": 4}'
+```
+
+Despite its historical name, `encoder_cudagraph_max_vision_items_per_batch`
+counts **audio clips** for Qwen3-ASR. Budgets count output audio tokens, not mel
+frames or decoder tokens. The default range is 64–512 tokens (capped by the
+model context length). A single clip larger than the largest budget uses eager
+execution; the manager packs smaller clips and restores their original order.
+
+For an RTX 5070 Ti, this is a starting configuration, not a measured optimum.
+The GPU has not been available for validation of this implementation. Confirm
+that the installed PyTorch and FlashAttention builds support the target GPU.
+Measure graph memory alongside model weights, decoder graphs, and KV cache;
+reduce budgets and concurrency if needed. Increasing the largest budget trades
+memory and capture time for fewer eager fallbacks.
+
+### Capture boundary and correctness
+
+The shared audio encoder previously computed lengths on the GPU and read them
+back for Python control flow. It now prepares chunk lengths, output gather
+indices, and attention offsets on the CPU. Qwen3-ASR's processor already keeps
+lengths there. An explicit gather replaces dynamic boolean compaction, avoiding
+its device synchronization. Other users of the shared audio encoder can still
+pass GPU lengths.
+
+Keeping CNN processing outside capture preserves its existing padding width:
+for batches containing only short clips, extending that width to a fixed
+capture size can change convolution boundary outputs. Packing keeps each
+clip's attention windows separate. Replay copies fresh attention offsets and
+fills the unused offset entries with the final real offset, representing empty
+sequences. Padded hidden rows never become attention keys for real tokens.
+The maximum attention sequence length is a CPU scalar fixed at capture time,
+so FlashAttention does not read a GPU scalar during capture.
+
+The manager supplies graph pools, startup memory profiling, budget selection,
+static buffers, replay statistics, and cloned output slices. No separate audio
+graph cache or per-request capture is needed. Capturing the CNN would require
+additional shape buckets or a boundary-preserving convolution implementation;
+measure the remaining CNN and packing cost before adding that complexity.
+
+### Validation on the target GPU
+
+Run the real-weight regression (including startup capture, changed input
+lengths, output ownership across replays, eager fallback, and transcription
+logprobs):
+
+```bash
+.venv/bin/python -m pytest \
+  tests/models/multimodal/generation/test_vit_cudagraph.py \
+  -k qwen3_asr_encoder_cudagraph -v
+```
+
+This test is selected by the existing multimodal `core_model` CI job. GPU
+correctness, ASR corpus WER/CER, and performance results are still required
+before recommending production use. For performance, compare identical audio
+requests with encoder graphs disabled/enabled, warm up both paths, disable
+prefix caching for the comparison, and prevent multimodal cache hits from
+hiding encoder work. Report encoder latency, end-to-end latency, peak memory,
+and graph hit rate across short/long clips and the intended concurrency. A
+speedup cannot be inferred from graph coverage alone.

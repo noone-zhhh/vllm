@@ -775,3 +775,92 @@ def test_eonly_vit_cudagraph_outputs(
         for result in results:
             assert result["stats"][0]["token_budgets"] == token_budgets
         print(f"E-only {model_id}: {results}")
+
+
+def _check_asr_encoder_replay(worker):
+    import torch
+
+    runner = worker.model_runner
+    manager = runner.model_state.encoder_runner.cudagraph_manager
+    assert manager is not None and manager.is_captured()
+    model = runner.model
+    generator = torch.Generator(device=runner.device).manual_seed(42)
+    retained: list[tuple[torch.Tensor, torch.Tensor]] = []
+    hits, misses = manager.graph_hits, manager.graph_misses
+    # Short CNN widths, partial chunks, changing attention boundaries,
+    # multi-item packing, the 64-token boundary, and eager fallback.
+    for lengths in ([7], [99, 1], [100, 101], [493], [501], [801], [8]):
+        features = torch.randn(
+            model.audio_tower.num_mel_bins,
+            sum(lengths),
+            generator=generator,
+            device=runner.device,
+            dtype=model.audio_tower.dtype,
+        )
+        kwargs = {
+            "input_audio_features": features,
+            "audio_feature_lengths": torch.tensor(lengths),
+        }
+        with torch.inference_mode():
+            expected = model.embed_multimodal(**kwargs)
+            actual = manager.execute(kwargs)
+        assert len(actual) == len(expected)
+        for output, reference in zip(actual, expected):
+            assert torch.isfinite(output).all()
+            torch.testing.assert_close(output, reference, rtol=1e-2, atol=1e-2)
+        for output, snapshot in retained:
+            torch.testing.assert_close(output, snapshot, rtol=0, atol=0)
+        retained.extend((output, output.clone()) for output in actual)
+    assert manager.graph_hits - hits == 7
+    assert manager.graph_misses - misses == 2
+
+
+@pytest.mark.core_model
+def test_qwen3_asr_encoder_cudagraph(vllm_runner, monkeypatch):
+    """Real LLM startup/replay must preserve embeddings and transcription scores."""
+    from vllm.assets.audio import AudioAsset
+
+    from ...utils import check_logprobs_close
+
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    audio, sr = AudioAsset("mary_had_lamb").audio_and_sample_rate
+    audios = [(audio[:sr], sr), (audio, sr)]
+    prompt = (
+        "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|>"
+        "<|im_end|>\n<|im_start|>assistant\n"
+    )
+    results = []
+    for capture in (False, True):
+        with vllm_runner(
+            "Qwen/Qwen3-ASR-0.6B",
+            dtype="bfloat16",
+            max_model_len=2048,
+            max_num_seqs=2,
+            enable_prefix_caching=False,
+            mm_processor_cache_gb=0,
+            mm_encoder_attn_backend="FLASH_ATTN",
+            compilation_config={
+                "cudagraph_mode": "NONE",
+                "cudagraph_mm_encoder": capture,
+                "encoder_cudagraph_token_budgets": [16, 64],
+                "encoder_cudagraph_max_vision_items_per_batch": 2,
+            },
+        ) as model:
+            if capture:
+                model.llm.collective_rpc(_check_asr_encoder_replay)
+            results.append(
+                model.generate_greedy_logprobs(
+                    [prompt] * len(audios),
+                    32,
+                    5,
+                    audios=audios,
+                )
+            )
+    check_logprobs_close(
+        outputs_0_lst=results[0],
+        outputs_1_lst=results[1],
+        name_0="eager",
+        name_1="encoder graph",
+        always_check_logprobs=True,
+    )
